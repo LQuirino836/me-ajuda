@@ -14,6 +14,7 @@ load_dotenv()
 app = FastAPI(title="Me Ajuda")
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 MODELO = os.getenv("GEMINI_MODEL")
+MODELO_RESERVA = os.getenv("GEMINI_MODEL_RESERVA")
 
 INSTRUCAO = """Você é o Me Ajuda, um assistente pessoal.
 Responda sempre em português do Brasil, de forma clara e curta.
@@ -43,33 +44,41 @@ def salvar_memoria():
     ARQUIVO_MEMORIA.write_text(texto, encoding="utf-8")
 
 
-def criar_chat():
+historico = carregar_memoria()
+
+
+def criar_chat(modelo):
     contents = [
         types.Content(role=m["papel"], parts=[types.Part(text=m["texto"])])
         for m in historico
     ]
     return client.chats.create(
-        model=MODELO,
+        model=modelo,
         config=types.GenerateContentConfig(system_instruction=INSTRUCAO),
         history=contents,
     )
 
 
-historico = carregar_memoria()
-chat_sessao = criar_chat()
-
-
-def enviar_com_retry(texto):
+def enviar(texto, modelo):
+    sessao = criar_chat(modelo)
     espera = ESPERA_INICIAL
     for tentativa in range(1, TENTATIVAS + 1):
         try:
-            return chat_sessao.send_message(texto)
+            return sessao.send_message(texto)
         except errors.APIError as erro:
-            temporario = erro.code in ERROS_TEMPORARIOS
-            if not temporario or tentativa == TENTATIVAS:
+            if erro.code not in ERROS_TEMPORARIOS or tentativa == TENTATIVAS:
                 raise
             time.sleep(espera)
             espera *= 2
+
+
+def enviar_com_reserva(texto):
+    try:
+        return enviar(texto, MODELO)
+    except errors.APIError as erro:
+        if erro.code in ERROS_TEMPORARIOS and MODELO_RESERVA:
+            return enviar(texto, MODELO_RESERVA)
+        raise
 
 
 class Mensagem(BaseModel):
@@ -83,9 +92,8 @@ def status():
 
 @app.post("/chat")
 def chat(mensagem: Mensagem):
-    global chat_sessao
     try:
-        resposta = enviar_com_retry(mensagem.texto)
+        resposta = enviar_com_reserva(mensagem.texto)
     except errors.APIError as erro:
         if erro.code in ERROS_TEMPORARIOS:
             raise HTTPException(
@@ -98,7 +106,6 @@ def chat(mensagem: Mensagem):
         )
 
     if not resposta.text:
-        chat_sessao = criar_chat()
         raise HTTPException(
             status_code=502,
             detail="O Gemini não devolveu texto. Tente reformular.",
@@ -109,7 +116,6 @@ def chat(mensagem: Mensagem):
 
     if len(historico) > MAX_MENSAGENS:
         del historico[:-MAX_MENSAGENS]
-        chat_sessao = criar_chat()
 
     salvar_memoria()
     return {"resposta": resposta.text}
@@ -117,8 +123,6 @@ def chat(mensagem: Mensagem):
 
 @app.post("/reset")
 def reset():
-    global chat_sessao
     historico.clear()
     salvar_memoria()
-    chat_sessao = criar_chat()
     return {"status": "memória apagada"}
