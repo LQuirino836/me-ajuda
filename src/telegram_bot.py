@@ -1,5 +1,6 @@
 import asyncio
 import os
+from datetime import datetime
 
 import httpx
 from dotenv import load_dotenv
@@ -13,15 +14,32 @@ from telegram.ext import (
     filters,
 )
 
+import lembretes
+
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 DONO_ID = os.getenv("TELEGRAM_USER_ID", "").strip()
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
+AJUDA = (
+    "Comandos:\n"
+    "/lembrar 18:30 tomar remédio\n"
+    "/lembrar 25/12 09:00 comprar presente\n"
+    "/lembretes - lista os pendentes\n"
+    "/cancelar 2 - cancela o lembrete 2\n"
+    "/reset - apaga a memória da conversa"
+)
+
 
 def autorizado(update: Update) -> bool:
     return bool(DONO_ID) and str(update.effective_user.id) == DONO_ID
+
+
+async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autorizado(update):
+        return
+    await update.effective_message.reply_text(AJUDA)
 
 
 async def meuid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -52,18 +70,113 @@ async def conversar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if r.status_code == 200:
             await msg.reply_text(r.json()["resposta"])
         else:
-            await msg.reply_text("O Me Ajuda está com dificuldade agora. Tente de novo em instantes.")
+            await msg.reply_text(f"Erro {r.status_code}: {r.text[:200]}")
     except httpx.HTTPError:
         await msg.reply_text("Não consegui falar com o servidor do Me Ajuda. Ele está ligado?")
+
+
+# ---------- Lembretes ----------
+
+async def disparar(context: ContextTypes.DEFAULT_TYPE):
+    dados = context.job.data
+    prefixo = "⏰ (atrasado) " if dados.get("atrasado") else "⏰ "
+    await context.bot.send_message(dados["chat_id"], prefixo + dados["texto"])
+    restantes = [l for l in lembretes.carregar() if l["id"] != dados["id"]]
+    lembretes.salvar(restantes)
+
+
+def agendar(job_queue, item, atrasado=False):
+    quando = datetime.fromisoformat(item["quando"])
+    job_queue.run_once(
+        disparar,
+        5 if atrasado else quando,
+        data={**item, "atrasado": atrasado},
+        name=f"lembrete-{item['id']}",
+    )
+
+
+async def lembrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autorizado(update):
+        return
+    msg = update.effective_message
+    try:
+        quando, texto = lembretes.interpretar(context.args)
+    except ValueError:
+        await msg.reply_text(AJUDA)
+        return
+    if quando <= lembretes.agora():
+        await msg.reply_text("Esse horário já passou. Escolha um horário futuro.")
+        return
+
+    lista = lembretes.carregar()
+    novo_id = max([l["id"] for l in lista], default=0) + 1
+    item = {
+        "id": novo_id,
+        "quando": quando.isoformat(),
+        "texto": texto,
+        "chat_id": update.effective_chat.id,
+    }
+    lista.append(item)
+    lembretes.salvar(lista)
+    agendar(context.job_queue, item)
+    await msg.reply_text(f"Anotado! Lembrete {novo_id} para {quando:%d/%m às %H:%M}.")
+
+
+async def listar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autorizado(update):
+        return
+    msg = update.effective_message
+    lista = sorted(lembretes.carregar(), key=lambda l: l["quando"])
+    if not lista:
+        await msg.reply_text("Nenhum lembrete pendente.")
+        return
+    linhas = [
+        f"{l['id']}. {datetime.fromisoformat(l['quando']):%d/%m %H:%M} - {l['texto']}"
+        for l in lista
+    ]
+    await msg.reply_text("\n".join(linhas))
+
+
+async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autorizado(update):
+        return
+    msg = update.effective_message
+    try:
+        alvo = int(context.args[0])
+    except (IndexError, ValueError):
+        await msg.reply_text("Use assim: /cancelar 2")
+        return
+    lista = lembretes.carregar()
+    restantes = [l for l in lista if l["id"] != alvo]
+    if len(restantes) == len(lista):
+        await msg.reply_text("Não achei esse lembrete.")
+        return
+    lembretes.salvar(restantes)
+    for job in context.job_queue.get_jobs_by_name(f"lembrete-{alvo}"):
+        job.schedule_removal()
+    await msg.reply_text("Lembrete cancelado.")
+
+
+async def ao_iniciar(app: Application):
+    agora = lembretes.agora()
+    for item in lembretes.carregar():
+        quando = datetime.fromisoformat(item["quando"])
+        agendar(app.job_queue, item, atrasado=quando <= agora)
 
 
 def main():
     if not TOKEN:
         raise SystemExit("Falta o TELEGRAM_TOKEN no arquivo .env")
     asyncio.set_event_loop(asyncio.new_event_loop())  # compatibilidade com Python novo
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(ao_iniciar).build()
+    if app.job_queue is None:
+        raise SystemExit('Falta instalar: pip install "python-telegram-bot[job-queue]"')
+    app.add_handler(CommandHandler(["start", "ajuda"], ajuda))
     app.add_handler(CommandHandler("meuid", meuid))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("lembrar", lembrar))
+    app.add_handler(CommandHandler("lembretes", listar))
+    app.add_handler(CommandHandler("cancelar", cancelar))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversar))
     print("Bot do Me Ajuda ligado. Ctrl+C para parar.")
     app.run_polling()
