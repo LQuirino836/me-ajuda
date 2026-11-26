@@ -14,7 +14,7 @@ Em desenvolvimento. Já conversa com o Gemini via API.
 
 ## Roadmap
 - [x] Conexão com o Gemini
-- [ ] API própria (FastAPI)
+- [x] API própria (FastAPI)
 - [ ] Memória da conversa
 - [ ] Bot no Telegram
 - [ ] Voz
